@@ -69,38 +69,66 @@ def _read_cache(path: str, max_age_days: int = 1) -> pd.DataFrame | None:
 # --------------------------------------------------------------------------
 # 各数据源
 # --------------------------------------------------------------------------
-def _fetch_tencent(code: str, market: str, start: str = "", end: str = "", limit: int = 2000) -> pd.DataFrame:
+def _fetch_tencent(code: str, market: str, start: str = "", end: str = "", limit: int = 1000) -> pd.DataFrame:
     """腾讯财经接口：港股 hk{5位} / 美股 us{TICKER}。
 
-    实测单次上限约 2000–3000 根，超过会返回异常结构；因此先按 limit 取，
-    失败则自动降级到 1000 根。
+    实测单次返回上限 1000 根，所以想要长历史必须**分段回溯**：
+    固定 end、逐段往前取，直到覆盖 start（或已触到上市首日）。
     """
-    prefix = "hk" if market == "HK" else "us"
-    sym = f"{prefix}{code}"
+    # 美股走独立的 usfqkline 接口，且需要交易所后缀（.OQ=纳斯达克 / .N=纽交所）
+    endpoint = "usfqkline" if market == "US" else "hkfqkline"
+    if market == "US":
+        cands = [f"us{code}.OQ", f"us{code}.N", f"us{code}"]
+    elif market == "HK":
+        cands = [f"hk{code}"]
+    else:
+        cands = [f"us{code}"]
 
-    def _get(n: int) -> list:
-        url = (
-            f"https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get"
-            f"?param={sym},day,,,{n},qfq"
-        )
-        req = urllib.request.Request(url, headers=UA)
-        raw = urllib.request.urlopen(req, timeout=40).read().decode("utf-8", "ignore")
-        payload = json.loads(raw)
-        block = payload.get("data")
-        if not isinstance(block, dict) or sym not in block:
-            raise ValueError(f"腾讯接口无数据：{sym}")
-        node = block[sym]
-        if not isinstance(node, dict):
-            raise ValueError(f"腾讯接口返回异常：{sym}")
-        rows = node.get("qfqday") or node.get("day")
-        if not rows:
-            raise ValueError(f"腾讯接口无数据：{sym}")
-        return rows
+    def _get(n: int, s: str = "", e: str = "", only: str = "") -> tuple[list, str]:
+        last: Exception | None = None
+        for sym in ([only] if only else cands):
+            url = (
+                f"https://web.ifzq.gtimg.cn/appstock/app/{endpoint}/get"
+                f"?param={sym},day,{s},{e},{n},qfq"
+            )
+            try:
+                req = urllib.request.Request(url, headers=UA)
+                raw = urllib.request.urlopen(req, timeout=40).read().decode("utf-8", "ignore")
+                payload = json.loads(raw)
+                block = payload.get("data")
+                if not isinstance(block, dict) or sym not in block:
+                    last = ValueError(f"无数据：{sym}")
+                    continue
+                node = block[sym]
+                if not isinstance(node, dict):
+                    last = ValueError(f"结构异常：{sym}")
+                    continue
+                rows = node.get("qfqday") or node.get("day")
+                if rows:
+                    return rows, sym
+                last = ValueError(f"无数据：{sym}")
+            except Exception as ex:  # noqa: BLE001
+                last = ex
+        raise ValueError(f"腾讯接口无数据（{code}）：{last}")
 
-    try:
-        rows = _get(limit)
-    except Exception:
-        rows = _get(1000)
+    rows, used = _get(limit)
+    # 分段回溯：若最早一根仍晚于 start，说明被 1000 根上限截断，继续往前拉
+    if start:
+        seen: set[str] = set()
+        for _ in range(6):                      # 最多补 6 段 ≈ 6000 根，足够覆盖 20 年
+            first = rows[0][0]
+            if first <= start or first in seen:
+                break
+            seen.add(first)
+            # 把上一段最早日期的前一天作为新的 end
+            prev_day = (pd.Timestamp(first) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                more, _ = _get(limit, start, prev_day, only=used)
+            except Exception:  # noqa: BLE001
+                break
+            if not more or more[-1][0] >= first:
+                break
+            rows = more + rows
     # 行结构：date, open, close, high, low, volume
     df = pd.DataFrame(
         [

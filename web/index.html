@@ -9,8 +9,8 @@
 </head>
 <body>
 <header>
-  <div class="brand">QuantLab <span class="ver">v0.1</span></div>
-  <div class="tagline">向量化 + 事件驱动混合回测 · 参数扫描 · 样本外检验</div>
+  <div class="brand">QuantLab <span class="ver">v0.2</span></div>
+  <div class="tagline">向量化 + 事件驱动混合回测 · 参数扫描 · 样本外检验 · 稳健性验证 · 组合回测</div>
 </header>
 
 <div class="layout">
@@ -70,7 +70,23 @@
         <label>止盈 %<input id="takeProfit" type="number" placeholder="30" step="0.5"></label>
       </div>
       <label>移动止损 %<input id="trailing" type="number" placeholder="15" step="0.5"></label>
-      <div class="hint">止损/止盈/移动止损仅在事件驱动引擎下生效。</div>
+      <label>成本模型（按市场套真实费率）
+        <select id="costMarket">
+          <option value="">自定义（用上面的佣金/滑点）</option>
+          <option value="A">A 股 · 印花税0.05%+最低佣金5元</option>
+          <option value="HK" selected>港股 · 印花税0.10%双边</option>
+          <option value="US">美股 · 零佣+冲击成本</option>
+          <option value="CRYPTO">加密货币 · taker 0.05%</option>
+          <option value="IDEAL">零成本（对照用）</option>
+        </select>
+      </label>
+      <label>滑点模型
+        <select id="slippageMode">
+          <option value="pct">固定比例</option>
+          <option value="volume" selected>成交量冲击（随成交量占比²增长）</option>
+        </select>
+      </label>
+      <div class="hint">止损/止盈/移动止损仅在事件驱动引擎下生效。选了成本模型会覆盖手填的佣金/滑点。</div>
     </section>
 
     <button id="btnRun" class="primary">运行回测</button>
@@ -84,6 +100,8 @@
       <button class="tab active" data-tab="bt">单策略回测</button>
       <button class="tab" data-tab="opt">参数扫描</button>
       <button class="tab" data-tab="wf">样本外检验</button>
+      <button class="tab" data-tab="rb">稳健性验证</button>
+      <button class="tab" data-tab="pf">组合回测</button>
       <button class="tab" data-tab="help">说明</button>
     </nav>
 
@@ -95,6 +113,17 @@
       <div class="chartbox"><div class="ct">月度收益</div><div id="chartMonthly" class="chart" style="height:220px"></div></div>
       <div class="chartbox"><div class="ct">成交记录</div>
         <div class="tablewrap"><table id="tradeTable"></table></div>
+      </div>
+
+      <div class="sec-title">诊断</div>
+      <div id="diagCards" class="cards"></div>
+      <div class="chartbox"><div class="ct">滚动夏普 / 滚动回撤（绩效是否只来自某段时间）</div><div id="chartRolling" class="chart" style="height:280px"></div></div>
+      <div class="chartbox"><div class="ct">年度 × 月度收益热力图</div><div id="chartHeat" class="chart" style="height:260px"></div></div>
+      <div class="chartbox"><div class="ct">分年收益 vs 基准（买入持有）</div>
+        <div class="tablewrap"><table id="yearlyTable"></table></div>
+      </div>
+      <div class="chartbox"><div class="ct">收益分布诊断</div>
+        <div class="tablewrap"><table id="distTable"></table></div>
       </div>
     </div>
 
@@ -134,6 +163,96 @@
       <div class="tablewrap"><table id="wfTable"></table></div>
     </div>
 
+    <!-- 稳健性验证 -->
+    <div class="tabpane" id="pane-rb">
+      <div class="optbar">
+        <label>对照指标
+          <select id="rbMetric">
+            <option value="sharpe">夏普比率</option>
+            <option value="total_return">总收益</option>
+            <option value="cagr">年化收益</option>
+            <option value="calmar">Calmar</option>
+          </select>
+        </label>
+        <label>自助次数 <input id="nBoot" type="number" value="800" style="width:80px"></label>
+        <label>随机次数 <input id="nIter" type="number" value="300" style="width:80px"></label>
+        <label>试验次数(DSR) <input id="nTrials" type="number" value="200" style="width:80px"></label>
+        <button id="btnRobust" class="primary">运行四项检验</button>
+        <span id="rbInfo" class="hint"></span>
+      </div>
+
+      <div id="verdict" class="verdict-box"></div>
+
+      <div class="sec-title">① 自助置信区间（块自助，保留波动率聚集）</div>
+      <div class="tablewrap"><table id="bootTable"></table></div>
+      <div class="chartbox"><div class="ct">夏普比率的自助分布（竖线 = 真实值）</div><div id="chartBoot" class="chart" style="height:240px"></div></div>
+
+      <div class="sec-title">② 随机策略对照（保持交易次数与持仓时长，随机放入场时机）</div>
+      <div id="randCards" class="cards"></div>
+      <div class="chartbox"><div class="ct">随机策略的指标分布 vs 你的策略</div><div id="chartRand" class="chart" style="height:260px"></div></div>
+
+      <div class="sec-title">③ 通缩夏普比（校正「扫了多少组参数」的选择偏差）</div>
+      <div class="tablewrap"><table id="dsrTable"></table></div>
+
+      <div class="sec-title">④ 参数高原（最优点是不是孤岛）</div>
+      <div id="plateauVerdict" class="hint"></div>
+      <div class="chartbox"><div class="ct">各参数邻域表现</div><div id="chartPlateau" class="chart" style="height:280px"></div></div>
+    </div>
+
+    <!-- 组合回测 -->
+    <div class="tabpane" id="pane-pf">
+      <div class="optbar">
+        <label>标的（逗号分隔）
+          <input id="pfSymbols" value="01810,00700,09988,03690" style="width:230px">
+        </label>
+        <label>市场
+          <select id="pfMarket">
+            <option value="A">A 股</option>
+            <option value="HK" selected>港股</option>
+            <option value="US">美股</option>
+            <option value="CRYPTO">加密货币</option>
+          </select>
+        </label>
+      </div>
+      <div class="optbar">
+        <label>模式
+          <select id="pfMode">
+            <option value="momentum" selected>截面动量轮动</option>
+            <option value="hold">全部标的持有</option>
+          </select>
+        </label>
+        <label>加权
+          <select id="pfWeight">
+            <option value="equal">等权</option>
+            <option value="inv_vol" selected>波动率倒数</option>
+            <option value="risk_parity">风险平价</option>
+          </select>
+        </label>
+        <label>回看天数 <input id="pfLookback" type="number" value="60" style="width:70px"></label>
+        <label>持仓数 <input id="pfTopK" type="number" value="2" style="width:60px"></label>
+        <label>再平衡
+          <select id="pfReb">
+            <option value="D">每日</option>
+            <option value="W">每周</option>
+            <option value="ME" selected>每月</option>
+            <option value="QE">每季</option>
+          </select>
+        </label>
+        <button id="btnPf" class="primary">运行组合回测</button>
+      </div>
+
+      <div id="pfCards" class="cards"></div>
+      <div class="chartbox"><div class="ct">组合净值与回撤</div><div id="chartPF" class="chart" style="height:300px"></div></div>
+      <div class="chartbox"><div class="ct">加权方式对比（同一信号、同一成本）</div>
+        <div class="tablewrap"><table id="pfCompare"></table></div>
+      </div>
+      <div class="grid2">
+        <div class="chartbox"><div class="ct">各标的收益贡献</div><div id="chartContrib" class="chart" style="height:260px"></div></div>
+        <div class="chartbox"><div class="ct">相关性矩阵（判断是否真分散）</div><div id="chartCorr" class="chart" style="height:260px"></div></div>
+      </div>
+      <div id="pfInfo" class="hint"></div>
+    </div>
+
     <!-- 说明 -->
     <div class="tabpane" id="pane-help">
       <div class="doc">
@@ -143,6 +262,31 @@
           <li><b>向量化引擎</b>：单 bar 收益 = open<sub>t+1</sub>/open<sub>t</sub> − 1，成本 = 换手率 ×（佣金+滑点）。毫秒级，适合几千组参数扫描。</li>
           <li><b>事件驱动引擎</b>：逐 bar 推进，含真实股数、手续费、盘中<b>止损/止盈/移动止损</b>、A股 T+1。用于最终验证。</li>
           <li>行业惯例：<b>先用向量化扫参数，再用事件驱动精验证</b>。</li>
+          <li>口径差异：向量化按<b>持仓段</b>计交易（一段连续持仓 = 1 笔），事件驱动按<b>实际成交</b>计。
+             因此连续型策略（vol_target / grid）在两引擎下交易次数会差很多，但净值应基本一致。</li>
+        </ul>
+        <h3>成本模型（为什么默认参数会骗你）</h3>
+        <ul>
+          <li>A 股：<b>卖出印花税 0.05%</b> + 佣金万 2.5（<b>最低 5 元</b>）+ 过户费 0.001%。</li>
+          <li>港股：<b>印花税 0.10% 双边</b> + 交易征费/交收费/交易费合计约 0.014% + 佣金 0.05%。往返成本约 <b>0.53%</b>。</li>
+          <li>美股：多数券商零佣，成本主要是买卖价差与冲击成本。</li>
+          <li>滑点可用<b>成交量冲击模型</b>：冲击 ∝（委托量 / 当日成交量）²，小资金近乎无滑点，大资金显著变差。</li>
+          <li>含义：<b>策略的每笔预期毛利必须高于往返成本</b>，否则交易越勤亏得越快。</li>
+        </ul>
+        <h3>稳健性验证（四项，彼此独立、可交叉验证）</h3>
+        <ul>
+          <li><b>自助置信区间</b>：平稳块自助（Politis-Romano），保留波动率聚集，给出夏普/收益/回撤的 5%–95% 区间。</li>
+          <li><b>随机策略对照</b>（Aronson）：保持交易次数与持仓时长不变，把入场时机随机重排 N 次。真实策略落在随机分布的第几百分位 → p 值。
+              <b>它回答的是「赚的钱来自择时还是来自 beta」</b>，与「是否显著为正」是两个不同问题。</li>
+          <li><b>通缩夏普比</b>（Bailey &amp; López de Prado）：扫了 N 组参数后，最好的夏普本来就会偏高。DSR 把这个选择偏差扣掉。</li>
+          <li><b>参数高原</b>：把最优参数微调一档，看表现是否断崖式下跌。断崖 = 过拟合孤岛。</li>
+        </ul>
+        <h3>组合回测</h3>
+        <ul>
+          <li>支持<b>截面动量轮动</b>（每期按过去 N 日涨幅排序买最强的 top_k）与<b>全标的持有</b>。</li>
+          <li>加权：等权 / 波动率倒数 / <b>风险平价</b>（迭代使各标的风险贡献相等，单标的上限 60% 防角点解）。</li>
+          <li><b>再平衡日之间权重随价格漂移</b>，只在再平衡日付成本 —— 不这么做会低估换手成本。</li>
+          <li>输出年换手率、各标的贡献、相关性矩阵（平均两两相关高 = 分散是假象）。</li>
         </ul>
         <h3>样本外检验（Walk-Forward）</h3>
         <ul>

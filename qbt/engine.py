@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .costs import CostModel
+
 
 def _align(df: pd.DataFrame, signal: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
     df = df.copy()
@@ -30,14 +32,19 @@ def backtest_vector(
     commission: float = 0.0005,
     slippage: float = 0.0005,
     allow_short: bool = False,
+    cost: CostModel | None = None,
 ) -> dict:
     """向量化回测。
 
     收益口径：在 t 日开盘建仓、t+1 日开盘平仓/换仓，因此单 bar 收益 = open_{t+1}/open_t - 1。
-    成本：换手率 × (佣金 + 滑点)。
+    成本：买入换手 × 买入费率 + 卖出换手 × 卖出费率（含印花税、规费、最低佣金）。
     速度极快，适合扫几千组参数；但不模拟盘中止损/止盈 —— 那由事件驱动引擎负责。
     """
     df, sig = _align(df, signal)
+    if cost is not None:
+        cm = cost
+    else:
+        cm = CostModel(commission=commission, slippage=slippage, slippage_mode="pct")
     if not allow_short:
         sig = sig.clip(lower=0.0)
 
@@ -47,9 +54,21 @@ def backtest_vector(
     ret = (op.shift(-1) / op - 1.0).fillna(0.0)
     gross = pos * ret
 
-    turnover = (pos - pos.shift(1).fillna(0.0)).abs()
-    cost = turnover * (commission + slippage)
-    net = gross - cost
+    dpos = (pos - pos.shift(1).fillna(0.0))
+    buy_turn = dpos.clip(lower=0.0)
+    sell_turn = (-dpos).clip(lower=0.0)
+    slip = cm.slippage
+    buy_rate = cm.commission + cm.transfer_fee + (cm.stamp_duty if cm.stamp_duty_both_sides else 0.0) + slip
+    sell_rate = cm.commission + cm.transfer_fee + cm.stamp_duty + slip
+    cost_series = buy_turn * buy_rate + sell_turn * sell_rate
+
+    # 最低佣金：按「当日有交易」摊销到净值比例
+    if cm.min_commission > 0:
+        active = ((buy_turn.abs() + sell_turn.abs()) > 1e-9).astype(float)
+        eq_approx = initial_cash * (1.0 + gross).cumprod().shift(1).fillna(initial_cash)
+        cost_series = cost_series + active * (cm.min_commission / eq_approx.replace(0, np.nan)).fillna(0.0)
+
+    net = gross - cost_series
 
     equity = initial_cash * (1.0 + net).cumprod()
     equity.iloc[0] = initial_cash
@@ -57,12 +76,14 @@ def backtest_vector(
     return {
         "equity": equity,
         "position": pos,
-        "trades": _trades_from_position(df, pos, commission + slippage),
+        "trades": _trades_from_position(df, pos, buy_rate + sell_rate),
         "params": {
             "engine": "vector",
             "initial_cash": initial_cash,
-            "commission": commission,
-            "slippage": slippage,
+            "commission": cm.commission,
+            "slippage": cm.slippage,
+            "stamp_duty": cm.stamp_duty,
+            "cost_model": cm.to_dict(),
         },
     }
 
@@ -120,17 +141,25 @@ def backtest_event(
     trailing_stop: float | None = None,
     max_weight: float = 1.0,
     rebalance_tol: float = 0.02,
+    cost: CostModel | None = None,
 ) -> dict:
     """事件驱动回测：逐 bar 推进，精确模拟开盘成交、盘中止损/止盈、T+1。
 
     stop_loss / take_profit / trailing_stop 为比例（0.10 表示 -10%）。
     rebalance_tol：目标权重与当前权重差小于该阈值则不换仓，避免每日微幅抖动刷出假成交。
+    cost：传入 CostModel 时启用真实费率（印花税 / 最低佣金 / 成交量冲击滑点）。
     """
     df, sig = _align(df, signal)
+    if cost is not None:
+        cm = cost
+        slippage = cm.slippage
+    else:
+        cm = CostModel(commission=commission, slippage=slippage, slippage_mode="pct")
     op = df["open"].to_numpy(dtype=float)
     hi = df["high"].to_numpy(dtype=float)
     lo = df["low"].to_numpy(dtype=float)
     cl = df["close"].to_numpy(dtype=float)
+    vol = df["volume"].to_numpy(dtype=float) if "volume" in df.columns else np.zeros(len(df))
     idx = list(df.index)
 
     cash = float(initial_cash)
@@ -148,13 +177,14 @@ def backtest_event(
         nonlocal cash, shares, entry_price, peak_price, entry_bar, cur_trade
         if qty <= 0:
             return
-        px = price * (1 + slippage)
+        px = cm.buy_price(price, vol[bar] if bar < len(vol) else 0.0, qty)
         gross = qty * px
-        fee = gross * commission
+        fee = cm.fee(gross, "buy")
         if gross + fee > cash:
-            qty = max(cash / (px * (1 + commission)), 0.0)
+            rate = (fee / gross) if gross > 0 else cm.commission
+            qty = max(cash / (px * (1 + rate)), 0.0)
             gross = qty * px
-            fee = gross * commission
+            fee = cm.fee(gross, "buy")
         cash -= gross + fee
         shares += qty
         if cur_trade is None:
@@ -171,9 +201,9 @@ def backtest_event(
         if qty <= 0 or shares <= 0:
             return
         qty = min(qty, shares)
-        px = price * (1 - slippage)
+        px = cm.sell_price(price, vol[bar] if bar < len(vol) else 0.0, qty)
         gross = qty * px
-        fee = gross * commission
+        fee = cm.fee(gross, "sell")
         cash += gross - fee
         shares -= qty
         if cur_trade is not None:
@@ -271,12 +301,15 @@ def backtest_event(
         "params": {
             "engine": "event",
             "initial_cash": initial_cash,
-            "commission": commission,
-            "slippage": slippage,
+            "commission": cm.commission,
+            "slippage": cm.slippage,
+            "stamp_duty": cm.stamp_duty,
+            "min_commission": cm.min_commission,
             "t_plus_1": t_plus_1,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "trailing_stop": trailing_stop,
+            "cost_model": cm.to_dict(),
         },
     }
 
